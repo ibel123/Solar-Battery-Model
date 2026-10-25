@@ -38,14 +38,13 @@ The model answers three things:
 ├── Solar_Battery_Model.html       The knitted report
 ├── Solar_Battery_Model.R          The same code as a plain R script
 ├── reference.docx                 Word style template (only needed to knit to Word)
-├── Data for candidate 2026.xlsx   Input data: hourly solar generation and usage for 2020
 └── README.md
 ```
 
 Files created when the code runs: `hourly_model_results.csv` (the full hourly results) and, if you run the .R script, seven png figures.
 
 **Reading the report online:** GitHub shows .html files as plain code, not as a web page. To view the report as a page, switch on GitHub Pages (Settings > Pages > Deploy from a branch > main, root folder) and open
-`https://<your-username>.github.io/<repository-name>/Solar_Battery_Model.html`
+`https://<ibel123>.github.io/<Solar-Battery-Model>/index.html`
 Renaming the file to `index.html` makes the shorter address work.
 
 ---
