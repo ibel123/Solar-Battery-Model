@@ -43,8 +43,8 @@ The model answers three things:
 
 Files created when the code runs: `hourly_model_results.csv` (the full hourly results) and, if you run the .R script, seven png figures.
 
-**Reading the report online:** GitHub shows .html files as plain code, not as a web page. To view the report as a page, switch on GitHub Pages (Settings > Pages > Deploy from a branch > main, root folder) and open
-`https://<ibel123>.github.io/<Solar-Battery-Model>/index.html`
+**Reading the report online:** GitHub shows .html files as plain code, not as a web page. To view the report:
+[https://<ibel123>.github.io/<Solar-Battery-Model>/index.html](https://ibel123.github.io/Solar-Battery-Model/)
 Renaming the file to `index.html` makes the shorter address work.
 
 ---
