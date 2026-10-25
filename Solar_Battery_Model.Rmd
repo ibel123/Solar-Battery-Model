@@ -1,0 +1,747 @@
+---
+title: 'Solar Battery Savings Model: Documentation and Results'
+author: "Ibaale Eric"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    df_print: paged
+  word_document:
+    reference_docx: reference.docx
+    fig_caption: true
+---
+
+```{r setup, include=FALSE}
+# Hide code, warnings and messages in the Word file
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE,
+                      error = FALSE, fig.width = 6.3, fig.height = 3.6, dpi = 150)
+options(scipen = 999, warn = -1)
+library(readxl)
+
+# Inputs taken from the brief
+file_name    <- "Data for candidate 2026.xlsx"  # sits in the same folder as this file
+battery_cost <- 7000    # $ paid on 1 January 2022
+battery_cap  <- 12.5    # kWh, the most the battery can hold
+price_2022   <- 0.17    # $ per kWh from 1 January 2022
+disc_rate    <- 0.06    # discount rate
+n_years      <- 20      # battery life: 2022 to 2041
+years        <- 2021 + 1:n_years
+spike_level  <- 20      # kWh in one hour. Above this I flagged the reading but kept it
+
+# Helpers that format numbers for the text and tables
+nf  <- function(x, d = 1) formatC(x, format = "f", digits = d, big.mark = ",")
+pct <- function(x, d = 1) paste0(formatC(100 * x, format = "f", digits = d), "%")
+pct_or_na <- function(x) ifelse(is.na(x), "not defined", pct(x, 2))
+usd <- function(x, d = 2) {
+  s <- formatC(abs(x), format = "f", digits = d, big.mark = ",")
+  ifelse(x < 0, paste0("-\\$", s), paste0("\\$", s))
+}
+```
+
+```{r load, results='hide'}
+# ---- Step 1: read the Excel file ----
+# The column names are not in row 1, so I read everything as text first
+# and look for the row that starts with the word "Hour"
+raw <- read_excel(file_name, sheet = "Raw Data", range = cell_cols("A:D"),
+                  col_names = FALSE, col_types = "text")
+header_row <- which(trimws(raw[[1]]) == "Hour")[1]
+body <- raw[(header_row + 1):nrow(raw), ]
+sheet_names <- excel_sheets(file_name)
+
+# Excel stores the date and hour as one number (days since 30 Dec 1899).
+# If a cell came through as a date in text form, this turns it back into that number.
+to_serial <- function(x) {
+  out <- suppressWarnings(as.numeric(x))
+  need <- is.na(out) & !is.na(x)
+  if (any(need)) {
+    as_time <- tryCatch(as.numeric(as.POSIXct(x[need], tz = "UTC")) / 86400 + 25569,
+                        error = function(e) rep(NA_real_, sum(need)))
+    out[need] <- as_time
+  }
+  out
+}
+
+d <- data.frame(hour   = suppressWarnings(as.numeric(body[[1]])),
+                serial = to_serial(body[[2]]),
+                solar  = suppressWarnings(as.numeric(body[[3]])),
+                usage  = suppressWarnings(as.numeric(body[[4]])))
+
+# Remove rows that are completely empty
+all_blank <- is.na(d$hour) & is.na(d$serial) & is.na(d$solar) & is.na(d$usage)
+d <- d[!all_blank, ]
+n_rows_read <- nrow(d)
+
+# Duplicated time stamps: keep the first one, then sort by time
+dup_time <- duplicated(d$serial) & !is.na(d$serial)
+n_dup_time <- sum(dup_time)
+d <- d[!dup_time, ]
+d <- d[order(d$serial), ]
+d$row <- seq_len(nrow(d))
+
+# Date, month and the hour worked out from the time stamp
+d$date  <- as.Date(floor(d$serial + 1e-6), origin = "1899-12-30")
+d$month <- as.integer(format(d$date, "%m"))
+d$hour_from_time <- round((d$serial - floor(d$serial + 1e-6)) * 24)
+
+# Keep the original values so I can compare before and after
+d$solar_raw <- d$solar
+d$usage_raw <- d$usage
+```
+
+```{r checks, results='hide'}
+# ---- Step 2: checks on the raw data (nothing is changed in this block) ----
+expected_rows   <- 365 * 24
+n_days          <- length(unique(d$date))
+n_feb29         <- sum(format(d$date, "%m-%d") == "02-29", na.rm = TRUE)
+n_odd_days      <- sum(table(d$date) != 24)
+n_jumps         <- sum(diff(round(d$serial * 24)) != 1, na.rm = TRUE)
+n_hour_clash    <- sum(d$hour != d$hour_from_time, na.rm = TRUE)
+n_missing_solar <- sum(is.na(d$solar))
+n_missing_usage <- sum(is.na(d$usage))
+
+# Flags for each problem I looked for
+d$neg_usage  <- !is.na(d$usage) & d$usage < 0
+d$neg_solar  <- !is.na(d$solar) & d$solar < 0
+d$huge_usage <- !is.na(d$usage) & d$usage > 1000
+d$dropout    <- !is.na(d$solar) & !is.na(d$usage) & d$solar == 0 & d$usage == 0 &
+                d$hour %in% 9:15
+d$spike      <- !is.na(d$usage) & d$usage > spike_level & d$usage <= 1000
+
+n_neg_solar  <- sum(d$neg_solar)
+n_neg_usage  <- sum(d$neg_usage)
+n_huge       <- sum(d$huge_usage)
+n_dropout    <- sum(d$dropout)
+n_spike      <- sum(d$spike)
+spike_max    <- max(d$usage[d$spike], 0)
+n_spike_day  <- sum(d$spike & d$hour %in% 9:12)
+
+dark_hours       <- d$hour %in% c(22, 23, 0:4)
+n_night_solar    <- sum(d$solar > 0 & dark_hours, na.rm = TRUE)
+max_night_solar  <- max(d$solar[which(d$solar > 0 & dark_hours)], 0)
+n_long_dec <- sum(!is.na(d$usage) & abs(d$usage * 1000 - round(d$usage * 1000)) > 1e-6)
+
+checks_tab <- data.frame(
+  Check = c("Data rows read from the sheet",
+            "Rows expected (365 days x 24 hours)",
+            "Different dates in the file",
+            "Rows dated 29 February",
+            "Days that did not have exactly 24 rows",
+            "Places where the hourly sequence jumped",
+            "Rows where the Hour column disagreed with the time stamp",
+            "Missing solar values",
+            "Missing usage values",
+            "Duplicated time stamps",
+            "Negative solar values",
+            "Negative usage values",
+            "Usage above 1,000 kWh in one hour",
+            "Daylight hours (9 am to 4 pm) with solar and usage both zero",
+            "Usage above 20 kWh in one hour (flagged, kept)",
+            "Non-zero solar between 10 pm and 4 am",
+            "Usage values with more than 3 decimal places"),
+  Result = c(nf(n_rows_read, 0), nf(expected_rows, 0), nf(n_days, 0), nf(n_feb29, 0),
+             nf(n_odd_days, 0), nf(n_jumps, 0), nf(n_hour_clash, 0),
+             nf(n_missing_solar, 0), nf(n_missing_usage, 0), nf(n_dup_time, 0),
+             nf(n_neg_solar, 0), nf(n_neg_usage, 0), nf(n_huge, 0), nf(n_dropout, 0),
+             nf(n_spike, 0), nf(n_night_solar, 0), nf(n_long_dec, 0)),
+  stringsAsFactors = FALSE)
+```
+
+```{r cleaning, results='hide'}
+# ---- Step 3: corrections ----
+# Which values need replacing
+fix_usage <- d$neg_usage | d$huge_usage | d$dropout | is.na(d$usage)
+fix_solar <- d$neg_solar | d$dropout | is.na(d$solar)
+n_fixed_rows <- sum(fix_usage | fix_solar)
+
+# Replacement = median for the same hour of the day, using only the good rows
+good <- !(fix_usage | fix_solar)
+med_usage <- tapply(d$usage[good], d$hour[good], median)
+med_solar <- tapply(d$solar[good], d$hour[good], median)
+d$usage[fix_usage] <- as.numeric(med_usage[as.character(d$hour[fix_usage])])
+d$solar[fix_solar] <- as.numeric(med_solar[as.character(d$hour[fix_solar])])
+
+# Table of the rows I changed (first 15 only, to keep the table short)
+why <- ifelse(d$neg_usage, "Negative usage",
+       ifelse(d$huge_usage, "Usage above 1,000 kWh",
+       ifelse(d$dropout, "Solar and usage both zero in daylight",
+       ifelse(d$neg_solar, "Negative solar", "Missing value"))))
+shown <- head(which(fix_usage | fix_solar), 15)
+fixed_tab <- data.frame(Date = format(d$date[shown], "%d %b"),
+                        Hour = d$hour[shown],
+                        Problem = why[shown],
+                        `Usage before` = nf(d$usage_raw[shown], 3),
+                        `Usage after` = nf(d$usage[shown], 3),
+                        `Solar before` = nf(d$solar_raw[shown], 3),
+                        `Solar after` = nf(d$solar[shown], 3),
+                        check.names = FALSE, stringsAsFactors = FALSE)
+
+usage_total_raw   <- sum(d$usage_raw, na.rm = TRUE)
+usage_total_clean <- sum(d$usage)
+solar_total_raw   <- sum(d$solar_raw, na.rm = TRUE)
+solar_total_clean <- sum(d$solar)
+
+# Average by hour of the day, before and after
+avg_by_hour <- function(x) as.numeric(tapply(x, d$hour, mean, na.rm = TRUE))
+raw_solar_avg   <- avg_by_hour(d$solar_raw)
+raw_usage_avg   <- avg_by_hour(d$usage_raw)
+clean_solar_avg <- avg_by_hour(d$solar)
+clean_usage_avg <- avg_by_hour(d$usage)
+h_chg <- which.max(abs(clean_usage_avg - raw_usage_avg)) - 1
+peak_use_hour   <- which.max(clean_usage_avg) - 1
+peak_solar_hour <- which.max(clean_solar_avg) - 1
+
+# Things I quote when I explain why I kept the spikes
+typical_usage  <- median(d$usage[!fix_usage])
+n_evening      <- sum(d$hour %in% 18:20)
+n_evening_big  <- sum(d$hour %in% 18:20 & d$usage_raw > 12 & !fix_usage, na.rm = TRUE)
+```
+
+```{r model, results='hide'}
+# ---- Step 4: the battery model ----
+# Goes through the hours in order. Solar is used first, then the battery,
+# then the electricity provider.
+run_battery <- function(solar, usage, cap) {
+  n <- length(solar)
+  bought_nb <- pmax(usage - solar, 0)   # (ii) bought, no battery
+  excess    <- pmax(solar - usage, 0)   # (iii) solar left over
+  charge <- discharge <- spilled <- level <- numeric(n)
+  prev <- 0                             # battery starts empty
+  for (i in 1:n) {
+    charge[i]    <- max(0, min(excess[i], cap - prev))  # what fits in the battery
+    spilled[i]   <- excess[i] - charge[i]               # what is lost
+    discharge[i] <- min(bought_nb[i], prev)             # what the battery gives back
+    level[i]     <- prev + charge[i] - discharge[i]     # (iv) battery level
+    prev <- level[i]
+  }
+  bought_b <- bought_nb - discharge                     # (v) bought, with battery
+  data.frame(bought_nb, excess, charge, spilled, discharge, level, bought_b)
+}
+
+d <- cbind(d, run_battery(d$solar, d$usage, battery_cap))
+
+extra_kwh   <- sum(d$bought_nb) - sum(d$bought_b)   # extra kWh met by the battery
+saving_2020 <- extra_kwh * price_2022               # (vi) saving at 2022 prices
+
+# (vii) monthly totals
+monthly <- aggregate(d[, c("solar", "usage", "bought_nb", "bought_b")],
+                     by = list(month = d$month), FUN = sum)
+
+# Save the full hourly results next to this file for anyone who wants to look
+invisible(try(write.csv(d[, c("date", "hour", "solar_raw", "usage_raw", "solar", "usage",
+                    "bought_nb", "excess", "level", "bought_b")],
+              "hourly_model_results.csv", row.names = FALSE), silent = TRUE))
+```
+
+```{r projection, results='hide'}
+# ---- Step 5: 20 year projection, NPV and IRR ----
+# Price in each year as a multiple of the 2022 price
+price_factors <- function(scenario, n = n_years) {
+  f <- numeric(n)
+  f[1] <- 1                                   # 2022
+  for (k in 2:n) {
+    if (scenario == 1) {
+      inflation <- 0.04                       # 4% every year
+    } else {
+      inflation <- 0.04 + 0.0025 * (k - 2)    # 4%, 4.25%, 4.5% ... from 2023
+    }
+    f[k] <- f[k - 1] * (1 + inflation)
+  }
+  f
+}
+
+# Present value of a list of yearly amounts, received at the end of each year
+pv <- function(cf, rate) sum(cf / (1 + rate)^seq_along(cf))
+
+# IRR: the rate at which the present value of the savings equals the cost
+find_irr <- function(cf, cost) {
+  f <- function(r) pv(cf, r) - cost
+  if (f(-0.5) * f(5) > 0) return(NA_real_)
+  uniroot(f, lower = -0.5, upper = 5, tol = 1e-10)$root
+}
+
+project <- function(extra, scenario, rate = disc_rate) {
+  price  <- price_2022 * price_factors(scenario)
+  saving <- extra * price
+  disc   <- saving / (1 + rate)^(1:n_years)
+  list(price = price, saving = saving, disc = disc,
+       pv = sum(disc), npv = sum(disc) - battery_cost,
+       irr = find_irr(saving, battery_cost))
+}
+
+s1 <- project(extra_kwh, 1)
+s2 <- project(extra_kwh, 2)
+
+# Year in which the running total of discounted savings passes the cost
+payback_year <- function(disc) {
+  k <- which(cumsum(disc) >= battery_cost)[1]
+  if (is.na(k)) "Not within 20 years" else as.character(2021 + k)
+}
+
+# Saving needed in the first year for the NPV to be zero
+need1 <- battery_cost / sum(price_factors(1) / (1 + disc_rate)^(1:n_years))
+need2 <- battery_cost / sum(price_factors(2) / (1 + disc_rate)^(1:n_years))
+
+# Sensitivity 1: spikes above 20 kWh replaced by the hourly median
+usage_alt <- d$usage
+usage_alt[d$spike] <- as.numeric(med_usage[as.character(d$hour[d$spike])])
+m_alt     <- run_battery(d$solar, usage_alt, battery_cap)
+extra_alt <- sum(m_alt$bought_nb) - sum(m_alt$bought_b)
+a1 <- project(extra_alt, 1)
+a2 <- project(extra_alt, 2)
+
+# Sensitivity 2: savings received in the middle of each year instead of the end
+pv_mid <- function(cf, rate) sum(cf / (1 + rate)^(seq_along(cf) - 0.5))
+mid1 <- pv_mid(s1$saving, disc_rate) - battery_cost
+mid2 <- pv_mid(s2$saving, disc_rate) - battery_cost
+
+conclusion <- if (s1$npv > 0 && s2$npv > 0) {
+  "In both scenarios the NPV was positive and the IRR was above 6%, so on these figures the battery paid for itself within its 20 years."
+} else if (s1$npv < 0 && s2$npv < 0) {
+  "In both scenarios the NPV was negative and the IRR was below 6%, so on these figures the battery did not pay for itself within its 20 years."
+} else {
+  "The two scenarios gave different answers: the NPV was positive in one and negative in the other, so the decision depends on which price path Naomi believes."
+}
+```
+
+```{r selfchecks, results='hide'}
+# ---- Step 6: self-checks on my own calculations ----
+tol <- 1e-8
+# A second, independent way of getting the battery level:
+# new level = old level + solar - usage, held between 0 and the cap
+ref_level <- Reduce(function(l, net) min(battery_cap, max(0, l + net)),
+                    d$solar - d$usage, 0, accumulate = TRUE)[-1]
+
+check_list <- c(
+  "No negative values in the bought, excess and battery columns" =
+    all(d[, c("bought_nb", "excess", "charge", "spilled", "discharge", "level", "bought_b")] >= -tol),
+  "Battery level always between 0 and 12.5 kWh" =
+    all(d$level >= -tol & d$level <= battery_cap + tol),
+  "Battery started empty (first level equals first charge less first discharge)" =
+    abs(d$level[1] - (d$charge[1] - d$discharge[1])) < tol,
+  "Each hour: usage = solar used + battery + bought (with battery)" =
+    all(abs(d$usage - ((d$solar - d$excess) + d$discharge + d$bought_b)) < tol),
+  "Each hour: usage = solar used + bought (no battery)" =
+    all(abs(d$usage - ((d$solar - d$excess) + d$bought_nb)) < tol),
+  "No hour with both excess solar and electricity bought" =
+    !any(d$excess > tol & d$bought_nb > tol),
+  "Excess solar = solar charged + solar lost, every hour" =
+    all(abs(d$excess - (d$charge + d$spilled)) < tol),
+  "Total charged = total discharged + final battery level" =
+    abs(sum(d$charge) - sum(d$discharge) - d$level[nrow(d)]) < 1e-6,
+  "Never more bought with the battery than without" =
+    all(d$bought_b <= d$bought_nb + tol),
+  "Battery never gave out more than it held" =
+    all(d$discharge <= c(0, d$level[-nrow(d)]) + tol),
+  "Electricity saved by the battery is no more than the excess solar" =
+    sum(d$discharge) <= sum(d$excess) + tol,
+  "Battery level matches the second, independent calculation" =
+    max(abs(ref_level - d$level)) < 1e-6,
+  "Monthly totals add up to the annual totals" =
+    all(abs(colSums(monthly[, c("solar", "usage", "bought_nb", "bought_b")]) -
+            c(sum(d$solar), sum(d$usage), sum(d$bought_nb), sum(d$bought_b))) < 1e-6),
+  "Discounting 20 years of 1 at 6% matches the annuity formula" =
+    abs(pv(rep(1, n_years), 0.06) - (1 - 1.06^(-n_years)) / 0.06) < 1e-9,
+  "Price paths match a hand calculation (2023 in scenario 1, 2025 in scenario 2)" =
+    abs(price_factors(1)[2] - 1.04) < tol &&
+    abs(price_factors(2)[4] - 1.04 * 1.0425 * 1.045) < tol,
+  "Present value at the IRR equals the battery cost (both scenarios)" =
+    isTRUE(abs(pv(s1$saving, s1$irr) - battery_cost) < 1e-4) &&
+    isTRUE(abs(pv(s2$saving, s2$irr) - battery_cost) < 1e-4)
+)
+selfcheck_tab <- data.frame(Check = names(check_list),
+                            Result = ifelse(check_list, "Passed", "Failed"),
+                            stringsAsFactors = FALSE)
+all_pass <- all(check_list)
+
+# Numbers used in the reasonableness paragraph
+daily_use        <- sum(d$usage) / n_days
+daily_solar      <- sum(d$solar) / n_days
+daily_discharge  <- sum(d$discharge) / n_days
+share_direct     <- sum(d$solar - d$excess) / sum(d$solar)
+share_captured   <- sum(d$charge) / sum(d$excess)
+share_avoided    <- extra_kwh / sum(d$bought_nb)
+hours_full       <- sum(d$level >= battery_cap - 1e-9)
+hours_empty      <- sum(d$level <= 1e-9)
+max_solar        <- max(d$solar)
+```
+
+# Summary of results
+
+I built a model in R that works through Naomi's 2020 electricity data one hour at a time, first with her solar panels alone and then with a 12.5 kWh battery added, and then projects the saving over the battery's 20 years. This document sets out what the model does, the checks I ran on the data and on my own calculations, the assumptions I made and the results.
+
+Over 2020 the battery would have met an extra `r nf(extra_kwh, 1)` kWh of Naomi's usage, which would otherwise have been bought from the provider. At the 1 January 2022 price of `r usd(price_2022)` per kWh that is a saving of `r usd(saving_2020)` for the year. Discounted at 6%, the 20 years of savings were worth `r usd(s1$pv, 0)` under scenario 1 (prices rising 4% a year) and `r usd(s2$pv, 0)` under scenario 2 (4% rising by a further 0.25% each year). Against the `r usd(battery_cost, 0)` cost, that gave an NPV of `r usd(s1$npv, 0)` and an IRR of `r pct_or_na(s1$irr)` for scenario 1, and an NPV of `r usd(s2$npv, 0)` and an IRR of `r pct_or_na(s2$irr)` for scenario 2. `r conclusion`
+
+# 1. Purpose of the model
+
+Naomi has solar panels on her roof. The power they make is used in the house as it is generated, and anything above what the house is using at that moment is wasted because she is not paid for it. She is thinking about buying a battery for `r usd(battery_cost, 0)` that would store the extra and give it back later. It would be installed on 1 January 2022, would hold at most `r battery_cap` kWh and would last 20 years.
+
+The model answers the questions she asked me. How much more of her usage could the panels and battery cover together, compared with the panels alone, and what is that worth in dollars? And, for two possible electricity price paths, what is the NPV (at 6% a year) and the IRR of buying the battery?
+
+I wrote the document so that a senior analyst can follow what was done and approve it, and so that a fellow analyst can check the steps, correct them or reuse the model. Table 1 shows where each part of the brief is dealt with.
+
+```{r map-table}
+map_tab <- data.frame(
+  `Part of the brief` = c("(i) Data checks, hourly averages graph, outliers, corrections",
+                          "(ii) Electricity bought, no battery",
+                          "(iii) Excess solar",
+                          "(iv) Battery charge level",
+                          "(v) Electricity bought, with battery",
+                          "(vi) Saving over 2020",
+                          "(vii) Monthly table and chart",
+                          "(viii) 20 year projection and NPV",
+                          "(ix) IRR",
+                          "(x) Code and documentation"),
+  `Where in this document` = c("Section 2", "Sections 4.2 and 5", "Sections 4.3 and 5",
+                               "Sections 4.4 and 5", "Sections 4.5 and 5", "Sections 4.6 and 5",
+                               "Sections 4.7 and 5", "Sections 4.8 and 5", "Sections 4.9 and 5",
+                               "This file"),
+  `Name in the code` = c("d, checks_tab, fix_usage, fix_solar", "bought_nb", "excess",
+                         "level (run_battery)", "bought_b", "saving_2020", "monthly",
+                         "project(), s1, s2", "find_irr()", "Solar_Battery_Model.Rmd"),
+  check.names = FALSE, stringsAsFactors = FALSE)
+knitr::kable(map_tab, caption = "Table 1: Where each part of the brief is handled",
+             align = c("l", "l", "l"))
+```
+
+The Rmd file reads the Excel file by name, so the Excel file has to be in the same folder as the Rmd file. No file paths on my computer are written into the code. When the file is knitted it also writes the full hourly results to a csv file called hourly_model_results.csv in that folder.
+
+# 2. Data
+
+## 2.1 What I was given
+
+I was given one Excel workbook with two sheets (`r paste(sheet_names, collapse = " and ")`). The sheet "Raw Data" holds hourly figures for 2020 in four columns: the hour of the day (0 is midnight to 1 am, 23 is 11 pm to midnight), the date and hour the reading starts, the electricity generated by the solar panels in kWh, and the electricity used in the house in kWh. The brief says 29 February was left out and that I could ignore it, so the year is 365 days. The second sheet, "Scoring", was empty.
+
+The column names were not in the first row of the sheet. They sat underneath a short note, so I found the header row by looking for the word "Hour" rather than counting rows. The date and hour are stored as one Excel serial number, so I worked out the calendar date and the hour from it and compared the hour with the Hour column.
+
+## 2.2 Checks and results
+
+I ran the checks in Table 2 on the raw data before changing anything.
+
+```{r checks-table}
+knitr::kable(checks_tab, caption = "Table 2: Checks on the raw data and what I found",
+             align = c("l", "r"))
+```
+
+I counted `r nf(n_rows_read, 0)` data rows against `r nf(expected_rows, 0)` expected for 365 days of 24 hours. I found `r nf(n_missing_solar + n_missing_usage, 0)` missing values and `r nf(n_dup_time, 0)` duplicated time stamps, and `r nf(n_hour_clash, 0)` rows where the Hour column and the time stamp disagreed. The brief says 29 February was left out, which should appear as one jump in the hourly sequence, and Table 2 shows `r nf(n_jumps, 0)` jump(s). Where a duplicated time stamp was found I kept the first row and dropped the rest.
+
+The problems were in the values themselves. There were `r nf(n_neg_usage, 0)` negative usage readings, which cannot be right because a house cannot use less than nothing. The largest usage reading in the raw file was `r nf(max(d$usage_raw, na.rm = TRUE), 1)` kWh, against a typical hour of `r nf(typical_usage, 2)` kWh. There were `r nf(n_dropout, 0)` daylight hours in which solar and usage were both exactly zero, which looked like the meter not recording. I also saw `r nf(n_night_solar, 0)` small solar readings in the dark hours, the largest being `r nf(max_night_solar, 3)` kWh. Finally, `r nf(n_long_dec, 0)` usage values carried long decimals while the rest had three, and some solar values showed floating point noise such as 0.009000000000000001. That is only how the numbers were stored, so I did nothing about it.
+
+## 2.3 Outliers I looked into
+
+Figure 1 is the graph the brief asks for: the average solar generation and the average usage for each hour of the day, using the raw data. I drew it before cleaning so that it would show what the problems did to the averages.
+
+```{r fig-raw, results='hide', fig.cap="Figure 1: Average solar generation and electricity usage by hour of the day, raw data"}
+plot_hourly <- function(solar_avg, usage_avg, title) {
+  par(family = "serif", mar = c(4.2, 4.5, 2.5, 1))
+  plot(0:23, usage_avg, type = "o", pch = 16, lwd = 2, col = "steelblue4",
+       ylim = c(0, max(c(solar_avg, usage_avg)) * 1.08), xaxt = "n",
+       xlab = "Hour of the day (0 = midnight to 1 am)", ylab = "Average kWh in the hour",
+       main = title)
+  lines(0:23, solar_avg, type = "o", pch = 16, lwd = 2, col = "darkorange")
+  axis(1, at = seq(0, 23, 2))
+  legend("topleft", legend = c("Electricity usage", "Solar generation"),
+         col = c("steelblue4", "darkorange"), lty = 1, pch = 16, bty = "n")
+}
+plot_hourly(raw_solar_avg, raw_usage_avg, "Before cleaning")
+```
+
+The usage line in Figure 1 is pulled out of shape at hour `r h_chg`, where the average was `r nf(raw_usage_avg[h_chg + 1], 2)` kWh. After cleaning it was `r nf(clean_usage_avg[h_chg + 1], 2)` kWh. I looked at the individual readings to see what caused that, and Figure 2 shows every hourly usage reading in the file.
+
+```{r fig-outliers, results='hide', fig.cap="Figure 2: Every hourly usage reading, with the vertical axis cut at 40 kWh. Red points are negative readings; the dashed line is the 20 kWh flag level"}
+n_off <- sum(d$usage_raw > 40 | d$usage_raw < -15, na.rm = TRUE)
+par(family = "serif", mar = c(4.2, 4.5, 2.5, 1))
+plot(d$row, d$usage_raw, pch = 16, cex = 0.35, col = "grey35", ylim = c(-15, 40),
+     xlab = "Hour number in the file (1 = first hour of 1 January)",
+     ylab = "Usage in the hour (kWh)", main = "Hourly usage readings")
+points(d$row[d$neg_usage], d$usage_raw[d$neg_usage], pch = 16, cex = 1, col = "red3")
+abline(h = spike_level, lty = 2, col = "darkorange3")
+legend("topright", legend = c("Negative reading", "20 kWh flag level"),
+       col = c("red3", "darkorange3"), pch = c(16, NA), lty = c(NA, 2), bty = "n")
+mtext(paste0(n_off, " reading(s) fall outside the range shown"), side = 3, line = 0,
+      cex = 0.7, adj = 1)
+```
+
+I treated the readings as follows.
+
+**Negative usage and usage above 1,000 kWh.** I treated these as errors. A negative usage is not possible, and the large reading (`r nf(max(d$usage_raw, na.rm = TRUE), 0)` kWh in one hour at its largest) is far beyond anything a house could use in an hour. I could not tell what the true values were. A sign flip was possible for the negatives, but I had no evidence for it, so I did not use it.
+
+**Both zero in daylight.** At hours 9 to 15 solar is normally well above zero, and a usage of exactly zero is very unusual. When both were zero together I took it as the meter dropping out and treated both values as missing. I only applied this rule between 9 am and 4 pm, because both can be close to zero at night without anything being wrong.
+
+**Usage above `r spike_level` kWh.** There were `r nf(n_spike, 0)` of these, with the highest at `r nf(spike_max, 1)` kWh. I thought about removing them, but I kept them as real usage. A house can reach that level in an hour when an oven, heating and a water heater run together, and nothing in the data proved they were wrong. Big readings are also common in the evening: `r nf(n_evening_big, 0)` of the `r nf(n_evening, 0)` readings between 6 pm and 9 pm were above 12 kWh, so the 20s looked like the top of the same pattern. `r nf(n_spike_day, 0)` of the spikes fell between 9 am and 1 pm, which was less expected, but the readings were not impossible. Replacing real usage would also have understated what the battery could save, and I show by how much in Section 6.
+
+**Small solar readings at night.** These were tiny (the largest was `r nf(max_night_solar, 3)` kWh) and look like sensor noise. I left them alone because they make no practical difference.
+
+## 2.4 Corrections
+
+I replaced each bad value with the median for the same hour of the day, worked out from the rows that were not flagged. I chose the hourly median because usage depends heavily on the time of day, and a median is not pulled around by the large readings. For negative usage and for usage above 1,000 kWh I replaced only usage. For the daylight dropouts I replaced both solar and usage. I made `r nf(n_fixed_rows, 0)` row replacements in total. Table 3 shows the first 15.
+
+```{r fixed-table}
+knitr::kable(fixed_tab, caption = "Table 3: Rows I corrected (first 15), before and after, in kWh",
+             align = c("l", "r", "l", "r", "r", "r", "r"))
+```
+
+The corrections changed total usage from `r nf(usage_total_raw, 1)` kWh to `r nf(usage_total_clean, 1)` kWh and total solar from `r nf(solar_total_raw, 1)` kWh to `r nf(solar_total_clean, 1)` kWh. Figure 3 repeats Figure 1 using the corrected data. The line is now smooth. Usage peaks at hour `r peak_use_hour` and solar peaks at hour `r peak_solar_hour`, which is what I expected for a house with panels on the roof.
+
+```{r fig-clean, results='hide', fig.cap="Figure 3: Average solar generation and electricity usage by hour of the day, after corrections"}
+plot_hourly(clean_solar_avg, clean_usage_avg, "After cleaning")
+```
+
+All later results use the corrected data. Appendix A lists the hourly averages behind Figures 1 and 3.
+
+# 3. Assumptions
+
+These are the assumptions I made, in addition to the figures given in the brief.
+
+1. The 2020 data was a typical year. I repeated it for every year from 2022 to 2041, so the battery saves the same number of kWh in each year and only the price changes.
+2. I worked in whole hours. Within an hour, usage was met from solar first, then from the battery, then from the provider, and excess solar went into the battery after the hour's usage was covered.
+3. The battery started empty at 1 January 2020 00:00, as the brief says. In the projection I did not carry any charge over from one year to the next.
+4. The battery had no losses when charging or discharging, no limit on how fast it could charge or discharge, and no loss of capacity over 20 years. The only limits were 0 and 12.5 kWh.
+5. Solar generated when the battery was full was lost. Naomi gets no payment for it, as the brief says.
+6. The 2022 price of `r usd(price_2022)` per kWh applied for the whole of 2022 and prices changed each 1 January from 2023. I valued the 2020 saving at 2022 prices, with no discounting, as the brief asks.
+7. In scenario 1 the price rose 4% each year. In scenario 2 it rose 4.00% on 1 January 2023, 4.25% in 2024, 4.50% in 2025 and so on, adding 0.25 percentage points each year.
+8. The battery was paid for on 1 January 2022. Each year's saving was received at the end of that year, and I discounted at 6% a year, constant for the 20 years. I ignored tax, maintenance and any cost of replacing parts.
+9. For the data, I assumed the replacement values described in Section 2.4 were close enough to the true values, and that the readings above `r spike_level` kWh were real usage.
+
+# 4. Methodology
+
+## 4.1 Preparing the data
+
+I read the sheet, found the header row, converted the four columns to numbers, worked out the date and hour of each row, and ran the checks in Section 2. I then corrected the bad values as described in Section 2.4. Everything after this point uses the corrected solar and usage columns.
+
+## 4.2 Electricity bought with no battery (part ii)
+
+For each hour I took usage less solar generation and set any negative answer to zero. If solar is above usage nothing needs to be bought, and the excess is dealt with in the next step.
+
+## 4.3 Excess solar (part iii)
+
+For each hour I took solar generation less usage and set any negative answer to zero. Because of this and the step above, an hour can have excess solar or electricity to buy but not both.
+
+## 4.4 Battery charge level (part iv)
+
+I went through the hours in time order. The level before the first hour was zero. In each hour:
+
+* the battery took in the smaller of the excess solar and the room left (12.5 kWh less the current level). Anything that did not fit was counted as lost;
+* the battery gave out the smaller of the electricity that would have had to be bought and the current level;
+* the new level was the old level plus what went in, less what came out.
+
+The level at the end of each hour is the charge level reported in the model. A simple loop does this in the code.
+
+## 4.5 Electricity bought with the battery (part v)
+
+For each hour this was the electricity that would have been bought with no battery, less what the battery gave out in that hour. It cannot go below zero because the battery never gives out more than would have been bought.
+
+## 4.6 Saving over 2020 (part vi)
+
+I added up the difference between the two bought columns over the year to get the extra kWh met by the battery. I multiplied that by `r usd(price_2022)` to get the saving in dollars, with no discounting.
+
+## 4.7 Monthly table and chart (part vii)
+
+I added up solar generation, usage, electricity bought with no battery and electricity bought with the battery for each calendar month. The results are in Table 5 and Figure 4.
+
+## 4.8 Projection and NPV (part viii)
+
+The saving in each year was the extra kWh from Section 4.6 multiplied by that year's price. For scenario 1 the price in each year was the previous year's price times 1.04. For scenario 2 it was the previous year's price times 1.04, then 1.0425, 1.045 and so on. I discounted each year's saving by (1 + 0.06) raised to the number of years since 1 January 2022 (1 for 2022, 2 for 2023, and so on) and added them up. I report this present value and also the NPV, which is the present value less the `r usd(battery_cost, 0)` cost.
+
+## 4.9 IRR (part ix)
+
+I found the discount rate at which the present value of the 20 years of savings equals the `r usd(battery_cost, 0)` cost, using a root finder (uniroot in R) searching between -50% and 500%. I did this separately for each scenario.
+
+# 5. Results
+
+## 5.1 Electricity bought, saved and lost in 2020
+
+```{r totals-table}
+totals_tab <- data.frame(
+  Item = c("Solar generation", "Electricity usage",
+           "Bought from the provider, no battery",
+           "Bought from the provider, with battery",
+           "Extra electricity met by the battery (the difference)",
+           "Excess solar with no battery",
+           "Excess solar that went into the battery",
+           "Excess solar lost because the battery was full"),
+  kWh = nf(c(sum(d$solar), sum(d$usage), sum(d$bought_nb), sum(d$bought_b), extra_kwh,
+             sum(d$excess), sum(d$charge), sum(d$spilled)), 1),
+  stringsAsFactors = FALSE)
+knitr::kable(totals_tab, caption = "Table 4: Annual totals for 2020 (kWh)", align = c("l", "r"))
+```
+
+The battery met an extra `r nf(extra_kwh, 1)` kWh, or `r pct(share_avoided)` of what Naomi would have bought without it. At `r usd(price_2022)` per kWh the saving over 2020 was `r usd(saving_2020)`.
+
+## 5.2 Monthly figures
+
+```{r monthly-table}
+monthly_tab <- data.frame(Month = month.abb[monthly$month],
+                          Solar = nf(monthly$solar, 1),
+                          Usage = nf(monthly$usage, 1),
+                          `Bought, no battery` = nf(monthly$bought_nb, 1),
+                          `Bought, with battery` = nf(monthly$bought_b, 1),
+                          `Saved by battery` = nf(monthly$bought_nb - monthly$bought_b, 1),
+                          check.names = FALSE, stringsAsFactors = FALSE)
+monthly_tab[nrow(monthly_tab) + 1, ] <- c("Year", nf(sum(monthly$solar), 1),
+                                          nf(sum(monthly$usage), 1),
+                                          nf(sum(monthly$bought_nb), 1),
+                                          nf(sum(monthly$bought_b), 1), nf(extra_kwh, 1))
+knitr::kable(monthly_tab, caption = "Table 5: Monthly totals for 2020 (kWh)",
+             align = c("l", "r", "r", "r", "r", "r"))
+```
+
+```{r fig-monthly, results='hide', fig.cap="Figure 4: Monthly solar generation, usage and electricity bought, with and without the battery (kWh)"}
+mat <- t(as.matrix(monthly[, c("solar", "usage", "bought_nb", "bought_b")]))
+par(family = "serif", mar = c(4.2, 4.8, 2.5, 1))
+barplot(mat, beside = TRUE, names.arg = month.abb[monthly$month],
+        col = c("darkorange", "steelblue4", "grey60", "seagreen4"),
+        ylim = c(0, max(mat) * 1.3), ylab = "kWh in the month",
+        main = "Monthly totals, 2020",
+        legend.text = c("Solar generation", "Electricity usage",
+                        "Bought, no battery", "Bought, with battery"),
+        args.legend = list(x = "top", bty = "n", cex = 0.75, ncol = 2))
+```
+
+## 5.3 How the battery behaved
+
+Figure 5 shows one week (13 to 19 January) to give a picture of what the battery did hour by hour. It charges while there is solar above usage and runs down when usage is higher than solar.
+
+```{r fig-week, results='hide', fig.height=5, fig.cap="Figure 5: Solar, usage and battery level, 13 to 19 January 2020"}
+wk <- which(d$date >= as.Date("2020-01-13") & d$date <= as.Date("2020-01-19"))
+if (length(wk) > 0) {
+  par(mfrow = c(2, 1), family = "serif", mar = c(3.5, 4.5, 2, 1))
+  ticks <- seq(1, length(wk), by = 24)
+  plot(seq_along(wk), d$usage[wk], type = "l", col = "steelblue4", xaxt = "n",
+       ylim = c(0, max(d$usage[wk], d$solar[wk])), xlab = "", ylab = "kWh in the hour",
+       main = "Solar generation and usage")
+  lines(seq_along(wk), d$solar[wk], col = "darkorange", lwd = 2)
+  axis(1, at = ticks, labels = format(d$date[wk][ticks], "%d %b"))
+  legend("topleft", legend = c("Usage", "Solar"), col = c("steelblue4", "darkorange"),
+         lty = 1, bty = "n", cex = 0.8)
+  plot(seq_along(wk), d$level[wk], type = "l", col = "seagreen4", lwd = 2, xaxt = "n",
+       ylim = c(0, battery_cap * 1.1), xlab = "", ylab = "Battery level (kWh)",
+       main = "Battery charge level")
+  abline(h = battery_cap, lty = 2, col = "grey40")
+  axis(1, at = ticks, labels = format(d$date[wk][ticks], "%d %b"))
+}
+```
+
+Over the year the battery was full in `r nf(hours_full, 0)` hours and empty in `r nf(hours_empty, 0)` of the `r nf(nrow(d), 0)` hours. It captured `r pct(share_captured)` of the excess solar, and `r nf(sum(d$spilled), 1)` kWh was lost because it was full.
+
+## 5.4 Projection, NPV and IRR
+
+Figure 6 shows the two price paths and Table 6 shows the 20 years of savings for each.
+
+```{r fig-price, results='hide', fig.cap="Figure 6: Electricity price per kWh, 2022 to 2041, under the two scenarios"}
+par(family = "serif", mar = c(4.2, 4.5, 2.5, 1))
+plot(years, s2$price, type = "o", pch = 16, cex = 0.7, col = "darkorange3", lwd = 2,
+     ylim = c(0, max(s2$price) * 1.05), xlab = "Year", ylab = "$ per kWh",
+     main = "Electricity price")
+lines(years, s1$price, type = "o", pch = 16, cex = 0.7, col = "steelblue4", lwd = 2)
+legend("topleft", legend = c("Scenario 1: 4% every year",
+                             "Scenario 2: 4%, rising by 0.25% each year"),
+       col = c("steelblue4", "darkorange3"), lty = 1, pch = 16, bty = "n")
+```
+
+```{r proj-table}
+proj_tab <- data.frame(Year = as.character(years),
+                       `S1 price` = nf(s1$price, 4), `S1 saving` = nf(s1$saving, 2),
+                       `S1 discounted` = nf(s1$disc, 2),
+                       `S2 price` = nf(s2$price, 4), `S2 saving` = nf(s2$saving, 2),
+                       `S2 discounted` = nf(s2$disc, 2),
+                       check.names = FALSE, stringsAsFactors = FALSE)
+proj_tab[nrow(proj_tab) + 1, ] <- c("Total", "", nf(sum(s1$saving), 2), nf(sum(s1$disc), 2),
+                                    "", nf(sum(s2$saving), 2), nf(sum(s2$disc), 2))
+knitr::kable(proj_tab, align = c("l", rep("r", 6)),
+             caption = "Table 6: Projected savings. Price in \\$ per kWh, saving and discounted saving in \\$. S1 = scenario 1, S2 = scenario 2")
+```
+
+```{r res-table}
+res_tab <- data.frame(
+  Measure = c("Total savings over 20 years, not discounted (\\$)",
+              "Present value of savings at 6% (\\$)",
+              "Battery cost (\\$)",
+              "NPV after the battery cost (\\$)",
+              "IRR",
+              "Year the discounted savings pass the cost"),
+  `Scenario 1` = c(nf(sum(s1$saving), 0), nf(s1$pv, 0), nf(battery_cost, 0), nf(s1$npv, 0),
+                   pct_or_na(s1$irr), payback_year(s1$disc)),
+  `Scenario 2` = c(nf(sum(s2$saving), 0), nf(s2$pv, 0), nf(battery_cost, 0), nf(s2$npv, 0),
+                   pct_or_na(s2$irr), payback_year(s2$disc)),
+  check.names = FALSE, stringsAsFactors = FALSE)
+knitr::kable(res_tab, caption = "Table 7: NPV and IRR of the battery for the two scenarios",
+             align = c("l", "r", "r"))
+```
+
+```{r fig-cum, results='hide', fig.cap="Figure 7: Running total of discounted savings against the cost of the battery"}
+par(family = "serif", mar = c(4.2, 4.5, 2.5, 1))
+plot(years, cumsum(s2$disc), type = "o", pch = 16, cex = 0.7, col = "darkorange3", lwd = 2,
+     ylim = c(0, max(cumsum(s2$disc), battery_cost) * 1.1), xlab = "Year",
+     ylab = "Discounted savings so far ($)", main = "Running total of discounted savings")
+lines(years, cumsum(s1$disc), type = "o", pch = 16, cex = 0.7, col = "steelblue4", lwd = 2)
+abline(h = battery_cost, lty = 2, col = "grey30")
+legend("topleft", legend = c("Scenario 1", "Scenario 2", "Battery cost"),
+       col = c("steelblue4", "darkorange3", "grey30"), lty = c(1, 1, 2),
+       pch = c(16, 16, NA), bty = "n")
+```
+
+Under scenario 1 the present value of the savings was `r usd(s1$pv, 0)`, so the NPV was `r usd(s1$npv, 0)` and the IRR was `r pct_or_na(s1$irr)`. Under scenario 2 the present value was `r usd(s2$pv, 0)`, the NPV was `r usd(s2$npv, 0)` and the IRR was `r pct_or_na(s2$irr)`. `r conclusion`
+
+To break even at 6%, the battery would have had to save about `r usd(need1, 0)` in the first year under scenario 1 (`r nf(need1 / price_2022, 0)` kWh) and about `r usd(need2, 0)` under scenario 2 (`r nf(need2 / price_2022, 0)` kWh). The model gave `r usd(saving_2020, 0)` (`r nf(extra_kwh, 0)` kWh).
+
+# 6. Further checks
+
+## 6.1 Self-checks in the model
+
+I built checks into the code that run every time the file is knitted. Table 8 lists them. `r if (all_pass) "All of them passed." else "Not all of them passed, and the ones marked Failed need to be looked at before the results are used."` One of them is a second, separate calculation of the battery level that uses a different formula from the loop in the main model, and the two agreed.
+
+```{r selfcheck-table}
+knitr::kable(selfcheck_tab, caption = "Table 8: Self-checks built into the model", align = c("l", "l"))
+```
+
+## 6.2 Reasonableness checks
+
+I also looked at whether the numbers made sense.
+
+* Average daily usage was `r nf(daily_use, 1)` kWh and average daily solar generation was `r nf(daily_solar, 1)` kWh. Solar was zero overnight and peaked at hour `r peak_solar_hour`, and the largest single solar hour was `r nf(max_solar, 2)` kWh.
+* Of all the solar generated, `r pct(share_direct)` was used in the house straight away.
+* On average the battery gave out `r nf(daily_discharge, 2)` kWh a day, which is below its 12.5 kWh capacity, as it has to be.
+* The battery was empty in `r nf(hours_empty, 0)` of the `r nf(nrow(d), 0)` hours and met `r pct(share_avoided)` of the electricity bought. `r if (hours_empty / nrow(d) > 0.5) "That fits with the evening usage being much larger than the solar the battery could store, so it emptied quickly each evening." else "The battery was not often empty, which fits with there being a lot of excess solar to store."`
+* The saving was no more than the excess solar. The battery cannot save more than it was given.
+* The price in 2041 was `r usd(price_2022 * price_factors(1)[n_years], 3)` per kWh under scenario 1 and `r usd(price_2022 * price_factors(2)[n_years], 3)` under scenario 2, which matches compounding the stated increases.
+
+## 6.3 Sensitivity to two choices I made
+
+I re-ran the model with two changes to see how much my choices mattered. The first replaced the readings above `r spike_level` kWh with the hourly median as well. The second assumed the savings arrive in the middle of each year rather than at the end.
+
+```{r sens-table}
+sens_tab <- data.frame(
+  Case = c("What I used", "Readings above 20 kWh replaced", "Savings received mid-year"),
+  `Total usage (kWh)` = c(nf(sum(d$usage), 0), nf(sum(usage_alt), 0), nf(sum(d$usage), 0)),
+  `Extra kWh from battery` = c(nf(extra_kwh, 1), nf(extra_alt, 1), nf(extra_kwh, 1)),
+  `Saving in 2020 (\\$)` = c(nf(saving_2020, 2), nf(extra_alt * price_2022, 2), nf(saving_2020, 2)),
+  `NPV S1 (\\$)` = c(nf(s1$npv, 0), nf(a1$npv, 0), nf(mid1, 0)),
+  `NPV S2 (\\$)` = c(nf(s2$npv, 0), nf(a2$npv, 0), nf(mid2, 0)),
+  check.names = FALSE, stringsAsFactors = FALSE)
+knitr::kable(sens_tab, caption = "Table 9: Sensitivity of the results to two choices", align = c("l", rep("r", 5)))
+```
+
+Replacing the large readings changed total usage from `r nf(sum(d$usage), 0)` kWh to `r nf(sum(usage_alt), 0)` kWh and the extra kWh from the battery from `r nf(extra_kwh, 1)` to `r nf(extra_alt, 1)`. Moving the receipt of savings to mid-year raised the NPV by about `r usd(mid1 - s1$npv, 0)` in scenario 1 and `r usd(mid2 - s2$npv, 0)` in scenario 2.
+
+# 7. Evaluation of the method and the results
+
+I want to be clear about where the results are weaker.
+
+1. **One year of data stands in for twenty.** I assumed every year from 2022 to 2041 looks like 2020. Naomi's usage could change (an electric car or a new appliance, for example), and solar output changes with the weather. Because the NPV rests on this repetition, a different mix of sunny and cloudy years would move it.
+2. **The battery was treated as perfect.** Real batteries lose some energy when charging and discharging, they have limits on how quickly they can charge and discharge, and they lose capacity with age. All of these would reduce the saving, so my figures are on the generous side.
+3. **Hourly data hides what happens within an hour.** Excess solar and usage can both happen inside the same hour, and I netted them. The hourly view could slightly overstate or understate the energy the battery would really have stored.
+4. **My corrections were estimates.** The replacement values were medians, not the true readings. There were only `r nf(n_fixed_rows, 0)` of them out of `r nf(nrow(d), 0)` hours, and Table 3 shows the replacements were ordinary values, so I think the effect on the annual totals is small. The larger judgement was keeping the readings above `r spike_level` kWh. Table 9 shows that choice changes the size of the saving, so it is the assumption I would most want the senior analyst to look at.
+5. **The price paths are given, not forecast.** I used the two scenarios in the brief. The IRR and NPV are sensitive to price inflation because the savings are paid over a long period, as Figure 7 shows.
+6. **The discounting convention matters a little.** Savings at the end of the year is a cautious choice, and Table 9 shows the mid-year alternative.
+7. **Things I left out.** Maintenance, the cost of replacing equipment during the 20 years, tax, and any change in the panels' output. None of them was in the brief.
+8. **The 12.5 kWh limit.** The battery was full in `r nf(hours_full, 0)` of the `r nf(nrow(d), 0)` hours. `r if (hours_full / nrow(d) < 0.05) "So the size limit did not bind often, and most of the time it was the amount of excess solar, not the battery size, that limited the saving." else "So the size limit did bind for part of the year, and a larger battery might have saved more."`
+
+# Appendix A: Average by hour of the day
+
+```{r hourly-table}
+hour_tab <- data.frame(Hour = 0:23,
+                       `Solar, raw` = nf(raw_solar_avg, 3), `Solar, corrected` = nf(clean_solar_avg, 3),
+                       `Usage, raw` = nf(raw_usage_avg, 3), `Usage, corrected` = nf(clean_usage_avg, 3),
+                       check.names = FALSE, stringsAsFactors = FALSE)
+knitr::kable(hour_tab, caption = "Table 10: Average kWh per hour, before and after corrections",
+             align = c("r", "r", "r", "r", "r"))
+```
