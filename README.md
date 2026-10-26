@@ -102,11 +102,11 @@ The full-year results are in the report. Key figures:
 
 | Measure | Scenario 1 | Scenario 2 |
 |---|---|---|
-| Extra electricity met by the battery in 2020 (kWh) | _fill in_ | _fill in_ |
-| Saving over 2020 at 2022 prices ($) | _fill in_ | _fill in_ |
-| Present value of 20 years of savings at 6% ($) | _fill in_ | _fill in_ |
-| NPV after the $7,000 cost ($) | _fill in_ | _fill in_ |
-| IRR | _fill in_ | _fill in_ |
+| Extra electricity met by the battery in 2020 (kWh) | 2,600 | 2,282 |
+| Saving over 2020 at 2022 prices ($) | 17,758 |21,107  |
+| Present value of 20 years of savings at 6% ($) | 9,446 | 10,759 |
+| NPV after the $7,000 cost ($) | 2,446 | 3,759 |
+| IRR | 9.45% | 10.74% |
 
 _(The extra kWh and the 2020 saving are the same in both scenarios; only the price path differs.)_
 
